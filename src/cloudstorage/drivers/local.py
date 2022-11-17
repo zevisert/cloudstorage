@@ -9,7 +9,7 @@ import shutil
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Union
 
 import filelock
 import itsdangerous
@@ -415,6 +415,48 @@ class LocalDriver(Driver):
             modified_at=modified_at,
         )
 
+    def _maybe_delete_empty_folders(
+        self, container: Container, object_name: Union[str, pathlib.Path]
+    ) -> None:
+        """Walk up the file tree and delete empty folders.
+
+        :param container: Stopping point - only delete children of the container.
+        :type container: :class:`.Container`
+
+        :param object_name: Filename to start walking upwards from. Need not exist.
+        :type object_name: str
+
+        :return: NoneType
+        :rtype: None
+        """
+
+        container_path = self._get_folder_path(container)
+        blob_path = pathlib.Path(object_name)
+        full_path = pathlib.Path(container_path, object_name)
+
+        # If object_name is absolute, it will fail .is_relative_to below.
+        # If object_name is relative, object_name.parent will never exceed '.'.
+        # Eg. Path('.').parent == Path('.')
+        if blob_path == pathlib.Path("."):
+            return
+
+        elif not full_path.is_dir():
+            # The starting object_name might have been a file, so try to remove
+            # it's parent folder.
+            self._maybe_delete_empty_folders(container, blob_path.parent)
+
+        # This prevents deleting folders outside of the container.
+        elif full_path.is_relative_to(container_path):
+            try:
+                with lock_local_file(str(full_path)):
+                    # Raises OSError if folder is not empty.
+                    full_path.rmdir()
+            except OSError:
+                return
+            else:
+                # Success, try the next parent folder.
+                self._maybe_delete_empty_folders(container, blob_path.parent)
+
     def validate_credentials(self) -> None:
         if not os.access(self.base_path, os.W_OK):
             raise CredentialsError(
@@ -581,6 +623,8 @@ class LocalDriver(Driver):
                 os.unlink(path)
             except OSError as err:
                 logger.exception(err)
+
+        self._maybe_delete_empty_folders(blob.container, blob.name)
 
         if self.is_windows:
             xattr = XattrWindows(path)
